@@ -130,7 +130,16 @@ fn hostile_threaded_comments_persons_and_note_vml() {
     use gridcraft_model::{Comment, Workbook};
     let mut wb = Workbook::new();
     let s = std::sync::Arc::make_mut(&mut wb.sheets[0]);
-    let c = |threaded| Comment { author: "A".into(), text: "t".into(), replies: vec![], threaded, resolved: false, visible: false, dates: vec![] };
+    let c = |threaded| Comment {
+        author: "A".into(),
+        text: "t".into(),
+        replies: vec![],
+        threaded,
+        resolved: false,
+        visible: false,
+        dates: vec![],
+        note_box: None,
+    };
     s.comments.insert(CellRef::new(0, 0), c(true));
     s.comments.insert(CellRef::new(1, 1), c(false));
     let good = write_xlsx(&wb).unwrap();
@@ -291,9 +300,7 @@ fn overlapping_column_entries_have_a_budget() {
     let parts = [("xl/styles.xml", r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>"#)];
     let rels = r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#;
     let cols = format!("<cols>{}</cols><sheetData/>", r#"<col min="1" max="16384" width="20" customWidth="1"/>"#.repeat(300));
-    let (wb, rep) = read_xlsx(&minimal(&cols, &parts, rels, "")).unwrap();
-    assert_eq!(wb.sheet(0).unwrap().cols.len(), 16_384);
-    assert!(rep.warnings.iter().any(|w| w.contains("column formats past the first")), "{:?}", rep.warnings);
+    assert!(matches!(read_xlsx(&minimal(&cols, &parts, rels, "")), Err(IoError::TooLarge(_))));
     // A normal list reads with no warning.
     let (wb, rep) = read_xlsx(&minimal(r#"<cols><col min="2" max="4" width="20" customWidth="1"/></cols><sheetData/>"#, &parts, rels, "")).unwrap();
     assert_eq!(wb.sheet(0).unwrap().cols.len(), 3);
@@ -357,4 +364,69 @@ fn hyperlinks_resolve_relationships_by_id() {
     assert_eq!(link("A1").as_deref(), Some("https://example.com/0"));
     assert_eq!(link("A5000").as_deref(), Some("https://example.com/4999"));
     assert_eq!(link("B1"), None);
+}
+
+#[test]
+fn repeated_column_ranges_have_one_worksheet_work_budget() {
+    // 62 * 16,384 = 1,015,808 assignments, while the map holds at most 16,384 columns.
+    // This stays small even on the unbounded reader, but exceeds the one-million work cap.
+    let col = r#"<col min="1" max="16384" width="10" customWidth="1"/>"#;
+    for (first, second) in [(62, 0), (31, 31)] {
+        let body = format!("<cols>{}</cols><cols>{}</cols><sheetData/>", col.repeat(first), col.repeat(second));
+        assert!(matches!(read_xlsx(&minimal(&body, &[], "", "")), Err(IoError::TooLarge(_))), "blocks: {first}, {second}");
+    }
+}
+
+#[test]
+fn column_work_budget_counts_only_clipped_nondefault_assignments() {
+    let full = r#"<col min="1" max="16384" width="10" customWidth="1"/>"#;
+    // Default-only records and invalid coordinates do not expand into column assignments.
+    let noise = format!(
+        "{}{}",
+        r#"<col min="1" max="16384" hidden="0" style="0"/>"#.repeat(62),
+        r#"<col min="0" max="16384" width="20"/>
+        <col min="16385" max="4294967295" width="20"/>
+        <col min="5" max="4" width="20"/>
+        <col min="bad" max="16384" width="20"/>"#
+    );
+    // The last declaration clips to 576 columns: 61 * 16,384 + 576 = 1,000,000.
+    let cols = format!("{noise}{}<col min=\"15809\" max=\"4294967295\" width=\"20\"/>", full.repeat(61));
+    let body = format!("<cols>{cols}</cols><sheetData/>");
+    let (wb, _) = read_xlsx(&minimal(&body, &[], "", "")).unwrap();
+    let sheet = wb.sheet(0).unwrap();
+    assert_eq!(sheet.cols.len(), 16_384);
+    assert_eq!(sheet.cols.get(&15_807).unwrap().size, Some(crate::tables::col_width_to_px(10.0)));
+    assert_eq!(sheet.cols.get(&15_808).unwrap().size, Some(crate::tables::col_width_to_px(20.0)));
+    assert_eq!(sheet.cols.get(&16_383).unwrap().size, Some(crate::tables::col_width_to_px(20.0)));
+
+    let body = format!("<cols>{cols}<col min=\"1\" max=\"1\" hidden=\"1\"/></cols><sheetData/>");
+    assert!(matches!(read_xlsx(&minimal(&body, &[], "", "")), Err(IoError::TooLarge(_))));
+}
+
+#[test]
+fn ordinary_overlapping_column_ranges_keep_last_declaration() {
+    let styles = r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+      <cellXfs count="2"><xf numFmtId="0"/><xf numFmtId="2"/></cellXfs></styleSheet>"#;
+    let rels = r#"<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>"#;
+    let body = r#"<cols><col min="1" max="3" width="10" hidden="1" style="1"/></cols>
+      <cols><col min="2" max="4" width="20" hidden="0" style="0"/>
+      <col min="5" max="5" hidden="1" style="1"/>
+      <col min="1" max="5"/></cols><sheetData/>"#;
+    let (wb, _) = read_xlsx(&minimal(body, &[("xl/styles.xml", styles)], rels, "")).unwrap();
+    let sheet = wb.sheet(0).unwrap();
+    assert_eq!(sheet.cols.len(), 5);
+    let first = sheet.cols.get(&0).unwrap();
+    assert_eq!(first.size, Some(crate::tables::col_width_to_px(10.0)));
+    assert!(first.hidden);
+    assert_eq!(wb.styles.get(first.style.unwrap()).num_fmt.as_str(), "0.00");
+    for col in 1..4 {
+        let info = sheet.cols.get(&col).unwrap();
+        assert_eq!(info.size, Some(crate::tables::col_width_to_px(20.0)));
+        assert!(!info.hidden);
+        assert_eq!(info.style, None);
+    }
+    let last = sheet.cols.get(&4).unwrap();
+    assert_eq!(last.size, None);
+    assert!(last.hidden);
+    assert_eq!(wb.styles.get(last.style.unwrap()).num_fmt.as_str(), "0.00");
 }
