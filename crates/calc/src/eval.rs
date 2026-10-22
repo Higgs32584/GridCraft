@@ -13,10 +13,14 @@ use gridcraft_model::Workbook;
 
 /// Largest array a reference may expand to.
 pub const MAX_CELLS: u64 = 16_000_000;
-/// References up to this many cells are read at their full size; larger ones (`A:A`, ranges
-/// reserved for data to come such as `$A$2:$A$50000`) stop at the sheet's used range, so that
-/// formulas over them stay fast.
+/// References up to this many cells (one whole row) are always read at their full size.
 const FULL_SIZE_CELLS: u64 = 16_384;
+/// Bounded references up to this many cells (one column's worth) are read at their full size too, as
+/// Excel does, so their shape lines up with the arrays next to them (`D3:AZ400*B3:B400` is 398 by
+/// 49 even when the data ends at column F) and their blanks count. References that run to the edge
+/// of the sheet (`A:A`, `A2:A1048576`, several whole rows) and larger blocks stop at the sheet's used
+/// range, so that formulas over them stay fast.
+const FULL_SIZE_BOUNDED_CELLS: u64 = 1_048_576;
 const MAX_DEPTH: usize = 400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -90,6 +94,8 @@ struct FnCtx<'a, 'h> {
     ev: &'a mut Evaluator<'h>,
     /// The criteria argument of a database function, when it is a reference.
     criteria: Option<Area>,
+    /// The LAMBDA given as the function argument of GROUPBY/PIVOTBY.
+    lambda: Option<Arc<Lambda>>,
 }
 
 impl Ctx for FnCtx<'_, '_> {
@@ -124,6 +130,19 @@ impl Ctx for FnCtx<'_, '_> {
         let mut ev = Evaluator { host: &mut *self.ev.host, sheet: area.sheet, at, env, depth: self.ev.depth };
         Some(matches!(ev.value(&shifted).scalar().to_bool(), Ok(true)))
     }
+    fn has_lambda(&self) -> bool {
+        self.lambda.is_some()
+    }
+    /// A LAMBDA must give one value per group; an array result is #CALC!.
+    fn call_lambda(&mut self, arg: Value) -> Option<Value> {
+        let l = self.lambda.clone()?;
+        let [p] = l.params.as_slice() else { return Some(Value::Error(CellError::Value)) };
+        let r = self.ev.call_lambda_values(&l, vec![(p.clone(), Ev::V(arg))]);
+        Some(match self.ev.deref(r) {
+            Value::Array(a) if a.data.len() != 1 => Value::Error(CellError::Calc),
+            v => v.scalar(),
+        })
+    }
 }
 
 impl<'h> Evaluator<'h> {
@@ -154,8 +173,13 @@ impl<'h> Evaluator<'h> {
         Ok(self.resolve_sheet(&r.sheet)?.into_iter().map(|sheet| Area { sheet, range }).collect())
     }
 
-    /// Dereferences: one cell → its value; a block → an array (trimmed to the used range);
-    /// several areas → `#VALUE!`.
+    /// Dereferences: one cell → its value; a block → an array; several areas → `#VALUE!`.
+    ///
+    /// A block keeps its full shape (blanks included) when it holds at most `FULL_SIZE_CELLS`
+    /// cells, or when it holds at most `FULL_SIZE_BOUNDED_CELLS` cells (one full column's worth)
+    /// and does not run to the sheet's last row or column. Every other block (larger, or a
+    /// bigger one that runs to the sheet's edge, such as `A:A` or `1:1`) is trimmed to the
+    /// sheet's used range before its values are read. An array over `MAX_CELLS` is `#NUM!`.
     pub fn deref(&mut self, ev: Ev) -> Value {
         match ev {
             Ev::V(v) => v,
@@ -174,7 +198,11 @@ impl<'h> Evaluator<'h> {
         // A reference keeps its size, so the array has its shape and its blanks count
         // (`=A1:A10`, `SUMPRODUCT(--(A1:A10=""))`).
         let cells = u64::from(a.range.height()) * u64::from(a.range.width());
-        let range = if cells > FULL_SIZE_CELLS { self.trim(a) } else { a.range };
+        // `A:A`, `1:1` and `A2:A1048576` run to the edge of the sheet: they stand for "the rest of
+        // the column", not for a block of a chosen size.
+        let to_edge = a.range.end.row == MAX_ROWS - 1 || a.range.end.col == MAX_COLS - 1;
+        let full_size = cells <= FULL_SIZE_CELLS || (!to_edge && cells <= FULL_SIZE_BOUNDED_CELLS);
+        let range = if full_size { a.range } else { self.trim(a) };
         let (h, w) = (range.height() as usize, range.width() as usize);
         if (h as u64) * (w as u64) > MAX_CELLS {
             return Value::Error(CellError::Num);
@@ -256,13 +284,13 @@ impl<'h> Evaluator<'h> {
     }
 
     fn name(&mut self, n: &str) -> Ev {
-        if let Some((_, v)) = self.env.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(n)) {
+        if let Some((_, v)) = self.env.iter().rev().find(|(k, _)| gridcraft_formula::same_name(k, n)) {
             return v.clone();
         }
         let wb = self.host.workbook();
         // Sheet-qualified `Sheet1!Name`.
         let (scope_sheet, bare) = match n.split_once('!') {
-            Some((s, b)) => match wb.sheet_index(s.trim_matches('\'')) {
+            Some((s, b)) => match wb.sheet_index(&gridcraft_core::unquote_sheet(s)) {
                 Some(i) => (i, b),
                 None => return err(CellError::Name),
             },
@@ -271,7 +299,7 @@ impl<'h> Evaluator<'h> {
         if let Some(def) = wb.name(bare, scope_sheet) {
             let text = def.formula.clone();
             let scope = def.scope.unwrap_or(self.sheet);
-            return match gridcraft_formula::parse(&text) {
+            return match gridcraft_formula::parse_name(&text) {
                 Ok(expr) => {
                     // Relative references in a name are relative to A1: used here, they move by
                     // this cell's offset from it.
@@ -618,7 +646,7 @@ impl<'h> Evaluator<'h> {
                         let value = self.value(a);
                         evaluated.push(Arg { value, from_ref: false });
                     }
-                    let mut ctx = FnCtx { ev: self, criteria: None };
+                    let mut ctx = FnCtx { ev: self, criteria: None, lambda: None };
                     return gridcraft_functions::call(spec, &evaluated, &mut ctx).pipe(Ev::V);
                 }
                 let i = match index.to_number() {
@@ -772,7 +800,7 @@ impl<'h> Evaluator<'h> {
                 Ev::L(Arc::new(Lambda { params, body: body.clone(), env: self.env.clone() }))
             }
             "ISOMITTED" => {
-                let r = matches!(args.first(), Some(Expr::Name(n)) if self.env.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(n)).is_some_and(|(_, v)| matches!(v, Ev::V(Value::Empty))));
+                let r = matches!(args.first(), Some(Expr::Name(n)) if self.env.iter().rev().find(|(k, _)| gridcraft_formula::same_name(k, n)).is_some_and(|(_, v)| matches!(v, Ev::V(Value::Empty))));
                 Ev::V(Value::Bool(r))
             }
             "MAP" | "REDUCE" | "SCAN" | "BYROW" | "BYCOL" | "MAKEARRAY" => self.higher_order(name, args),
@@ -817,8 +845,21 @@ impl<'h> Evaluator<'h> {
         let mut criteria_shape = None;
         // Database functions: the criteria range (argument 2), whose formulas are computed criteria.
         let mut criteria = None;
+        // GROUPBY/PIVOTBY: the LAMBDA given as their function.
+        let mut lambda = None;
+        let lambda_at = match name {
+            "GROUPBY" => Some(2),
+            "PIVOTBY" => Some(3),
+            _ => None,
+        };
         for (i, a) in args.iter().enumerate() {
             let mut ev = self.eval(a);
+            if lambda_at == Some(i)
+                && let Ev::L(l) = &ev
+            {
+                lambda = Some(l.clone());
+                ev = Ev::V(Value::Empty);
+            }
             if spec.category == gridcraft_functions::Category::Database
                 && i == 2
                 && let Ev::R(areas) = &ev
@@ -853,7 +894,7 @@ impl<'h> Evaluator<'h> {
             };
             evaluated.push(Arg { value, from_ref });
         }
-        let mut ctx = FnCtx { ev: self, criteria };
+        let mut ctx = FnCtx { ev: self, criteria, lambda };
         gridcraft_functions::call(spec, &evaluated, &mut ctx).pipe(Ev::V)
     }
 
@@ -907,13 +948,13 @@ impl<'h> Evaluator<'h> {
         };
         let args = [Arg { value, from_ref }];
         if kind != Agg::Count {
-            match gridcraft_functions::call(sum, &args, &mut FnCtx { ev: self, criteria: None }) {
+            match gridcraft_functions::call(sum, &args, &mut FnCtx { ev: self, criteria: None, lambda: None }) {
                 Value::Number(n) => acc.sum += n,
                 other => return Err(Ev::V(other)),
             }
         }
         if kind != Agg::Sum {
-            match gridcraft_functions::call(count, &args, &mut FnCtx { ev: self, criteria: None }) {
+            match gridcraft_functions::call(count, &args, &mut FnCtx { ev: self, criteria: None, lambda: None }) {
                 Value::Number(n) => acc.count = acc.count.saturating_add(n as u64),
                 other => return Err(Ev::V(other)),
             }
@@ -975,7 +1016,7 @@ impl<'h> Evaluator<'h> {
     /// that name.
     fn function_by_name(&self, e: &Expr) -> Option<String> {
         let Expr::Name(n) = e else { return None };
-        if self.env.iter().any(|(k, _)| k.eq_ignore_ascii_case(n)) || self.host.workbook().name(n, self.sheet).is_some() {
+        if self.env.iter().any(|(k, _)| gridcraft_formula::same_name(k, n)) || self.host.workbook().name(n, self.sheet).is_some() {
             return None;
         }
         let u = n.to_ascii_uppercase();
@@ -1012,15 +1053,18 @@ impl<'h> Evaluator<'h> {
                 let arrays: Vec<Arc<Array>> = args[..args.len() - 1].iter().map(|a| as_array(self.value(a))).collect();
                 let rows = arrays.iter().map(|a| a.rows).max().unwrap_or(1);
                 let cols = arrays.iter().map(|a| a.cols).max().unwrap_or(1);
-                if (rows * cols) as u64 > MAX_CELLS {
-                    return err(CellError::Num);
+                let Some(n) = broadcast_len(rows, cols) else { return err(CellError::Num) };
+                // The LAMBDA takes one parameter per array.
+                if l.params.len() != arrays.len() {
+                    return err(CellError::Value);
                 }
-                let mut out = Vec::with_capacity(rows * cols);
+                let mut out = Vec::with_capacity(n);
                 for r in 0..rows {
                     for c in 0..cols {
                         let bound = l.params.iter().zip(arrays.iter()).map(|(p, a)| (p.clone(), Ev::V(a.get_broadcast(r, c)))).collect();
                         let v = self.call_lambda_values(&l, bound);
-                        out.push(self.deref(v).scalar());
+                        let Some(one) = single(self.deref(v)) else { return err(CellError::Calc) };
+                        out.push(one);
                     }
                 }
                 Ev::V(Array::new(rows, cols, out).map(Value::from).unwrap_or(Value::Error(CellError::Calc)))
@@ -1041,7 +1085,8 @@ impl<'h> Evaluator<'h> {
                     let r = self.call_lambda_values(&l, bound);
                     acc = self.deref(r);
                     if name == "SCAN" {
-                        scan.push(acc.scalar());
+                        let Some(one) = single(acc.clone()) else { return err(CellError::Calc) };
+                        scan.push(one);
                     }
                 }
                 if name == "SCAN" {
@@ -1057,6 +1102,9 @@ impl<'h> Evaluator<'h> {
                 let arr = as_array(self.value(&args[0]));
                 let Some(l) = self.lambda_arg(args.get(1), 1) else { return err(CellError::Value) };
                 let Some(p) = l.params.first().cloned() else { return err(CellError::Value) };
+                if l.params.len() != 1 {
+                    return err(CellError::Value);
+                }
                 let by_row = name == "BYROW";
                 let n = if by_row { arr.rows } else { arr.cols };
                 let mut out = Vec::with_capacity(n);
@@ -1068,7 +1116,8 @@ impl<'h> Evaluator<'h> {
                     };
                     let a = if by_row { Array::row(slice) } else { Array::column(slice) };
                     let r = self.call_lambda_values(&l, vec![(p.clone(), Ev::V(a.into()))]);
-                    out.push(self.deref(r).scalar());
+                    let Some(one) = single(self.deref(r)) else { return err(CellError::Calc) };
+                    out.push(one);
                 }
                 let a = if by_row { Array::column(out) } else { Array::row(out) };
                 Ev::V(a.into())
@@ -1097,7 +1146,8 @@ impl<'h> Evaluator<'h> {
                             (l.params[1].clone(), Ev::V(Value::number(c as f64 + 1.0))),
                         ];
                         let v = self.call_lambda_values(&l, bound);
-                        out.push(self.deref(v).scalar());
+                        let Some(one) = single(self.deref(v)) else { return err(CellError::Calc) };
+                        out.push(one);
                     }
                 }
                 Ev::V(Array::new(rows, cols, out).map(Value::from).unwrap_or(Value::Error(CellError::Calc)))
@@ -1318,7 +1368,7 @@ impl<'h> Evaluator<'h> {
                         }
                     }
                 }
-                let mut ctx = FnCtx { ev: self, criteria: None };
+                let mut ctx = FnCtx { ev: self, criteria: None, lambda: None };
                 return match gridcraft_functions::call(spec, &xargs, &mut ctx) {
                     Value::Number(p) if p >= 1.0 => {
                         let k = p as u32 - 1;
@@ -1373,7 +1423,16 @@ impl<'h> Evaluator<'h> {
                 }))
             }
             "width" => Ev::V(Value::number(sheet.map_or(8.43, |s| gridcraft_model::points_to_chars(s.col_width(c.col) as f64)).round())),
-            "filename" => Ev::V(Value::text(String::new())),
+            // Excel's `<folder>/[<file>]<sheet>`, which the classic sheet-name formula splits on
+            // the `]`. Empty until the workbook has a file of its own, as in Excel (#1489).
+            "filename" => Ev::V(Value::text(match &wb.source_path {
+                Some(file) => {
+                    let name = file.file_name().unwrap_or_default().to_string_lossy();
+                    let on = sheet.map_or("", |s| s.name.as_str());
+                    file.parent().unwrap_or(std::path::Path::new("")).join(format!("[{name}]{on}")).to_string_lossy().into_owned()
+                }
+                None => String::new(),
+            })),
             "sheetname" => Ev::V(Value::text(sheet.map(|s| s.name.clone()).unwrap_or_default())),
             "protect" => Ev::V(Value::number(if sheet.is_some_and(|s| wb.styles.get(s.style_id(c)).protection.locked) { 1.0 } else { 0.0 })),
             "format" => {
@@ -1422,43 +1481,74 @@ impl<'h> Evaluator<'h> {
         if name == "AGGREGATE" && func >= 14 {
             k = rest.get(1).map(|e| self.value(e));
         }
+        // Every cell visited (even one skipped as hidden, nested or an error) and every value
+        // counts against one budget for the whole call. All arguments are evaluated (references
+        // stay lazy) and charged before any cell is read: a value stored in XFD1048576 makes
+        // `A:XFD` trim to the whole sheet, ~17 billion cells (#2175).
+        enum Input {
+            Cells(usize, RangeRef),
+            Values(Value),
+        }
+        let mut inputs = Vec::new();
+        let mut budget = MAX_CELLS;
         for e in refs {
             match self.eval(e) {
                 Ev::R(areas) => {
                     for a in areas {
                         let range = self.trim(&a);
-                        for c in range.iter() {
-                            let (hidden, nested) = {
-                                let wb = self.host.workbook();
-                                let s = wb.sheet(a.sheet);
-                                let hidden =
-                                    s.is_some_and(|s| if skip_hidden { s.is_row_hidden(c.row) } else { skip_filtered && s.is_row_filtered(c.row) });
-                                let nested = skip_nested
-                                    && s.and_then(|s| s.cell(c)).and_then(|cell| cell.formula.as_ref()).is_some_and(|f| {
-                                        let u = f.text.to_ascii_uppercase();
-                                        u.contains("SUBTOTAL(") || u.contains("AGGREGATE(")
-                                    });
-                                (hidden, nested)
-                            };
-                            if hidden || nested {
-                                continue;
-                            }
-                            let v = self.host.cell_value(a.sheet, c);
-                            if skip_errors && v.is_error() {
-                                continue;
-                            }
-                            values.push(v);
-                        }
+                        budget = match budget.checked_sub(range.count()) {
+                            Some(left) => left,
+                            None => return err(CellError::Num),
+                        };
+                        inputs.push(Input::Cells(a.sheet, range));
                     }
                 }
-                Ev::V(Value::Array(a)) => values.extend(a.data.iter().filter(|v| !(skip_errors && v.is_error())).cloned()),
-                Ev::V(v) => values.push(v),
+                Ev::V(v) => {
+                    let n = match &v {
+                        Value::Array(a) => u64::try_from(a.data.len()).unwrap_or(u64::MAX),
+                        _ => 1,
+                    };
+                    budget = match budget.checked_sub(n) {
+                        Some(left) => left,
+                        None => return err(CellError::Num),
+                    };
+                    inputs.push(Input::Values(v));
+                }
                 Ev::L(_) => return err(CellError::Value),
             }
         }
+        for input in inputs {
+            match input {
+                Input::Cells(sheet, range) => {
+                    for c in range.iter() {
+                        let (hidden, nested) = {
+                            let wb = self.host.workbook();
+                            let s = wb.sheet(sheet);
+                            let hidden =
+                                s.is_some_and(|s| if skip_hidden { s.is_row_hidden(c.row) } else { skip_filtered && s.is_row_filtered(c.row) });
+                            let nested = skip_nested
+                                && s.and_then(|s| s.cell(c)).and_then(|cell| cell.formula.as_ref()).is_some_and(|f| {
+                                    let u = f.text.to_ascii_uppercase();
+                                    u.contains("SUBTOTAL(") || u.contains("AGGREGATE(")
+                                });
+                            (hidden, nested)
+                        };
+                        if hidden || nested {
+                            continue;
+                        }
+                        let v = self.host.cell_value(sheet, c);
+                        if skip_errors && v.is_error() {
+                            continue;
+                        }
+                        values.push(v);
+                    }
+                }
+                Input::Values(Value::Array(a)) => values.extend(a.data.iter().filter(|v| !(skip_errors && v.is_error())).cloned()),
+                Input::Values(v) => values.push(v),
+            }
+        }
         if let Some(k) = k {
-            values.push(Value::Empty);
-            return Ev::V(gridcraft_functions::aggregate_values_k(func, &values[..values.len() - 1], &k));
+            return Ev::V(gridcraft_functions::aggregate_values_k(func, &values, &k));
         }
         Ev::V(gridcraft_functions::aggregate_values(func, &values))
     }
@@ -1615,7 +1705,8 @@ pub fn zip2(a: &Value, b: &Value, f: impl Fn(&Value, &Value) -> Value) -> Value 
         (Value::Array(x), Value::Array(y)) => {
             let rows = broadcast_dim(x.rows, y.rows);
             let cols = broadcast_dim(x.cols, y.cols);
-            let mut data = Vec::with_capacity(rows * cols);
+            let Some(n) = broadcast_len(rows, cols) else { return Value::Error(CellError::Num) };
+            let mut data = Vec::with_capacity(n);
             for r in 0..rows {
                 for c in 0..cols {
                     data.push(f(&x.get_broadcast(r, c), &y.get_broadcast(r, c)));
@@ -1627,6 +1718,13 @@ pub fn zip2(a: &Value, b: &Value, f: impl Fn(&Value, &Value) -> Value) -> Value 
         (s, Value::Array(y)) => Value::from(Array { rows: y.rows, cols: y.cols, data: y.data.iter().map(|v| f(s, v)).collect() }),
         (x, y) => f(x, y),
     }
+}
+
+/// Cell count of a `rows`×`cols` broadcast result, or `None` when it would exceed [`MAX_CELLS`].
+/// Each operand passes its own size cap, but their broadcast product can be far larger
+/// (`SEQUENCE(1048576)*SEQUENCE(1,16384)` is 17 billion cells), so it is checked before allocating.
+fn broadcast_len(rows: usize, cols: usize) -> Option<usize> {
+    rows.checked_mul(cols).filter(|&n| n as u64 <= MAX_CELLS)
 }
 
 fn broadcast_dim(a: usize, b: usize) -> usize {
@@ -1645,14 +1743,24 @@ fn zip3(c: &Array, t: &Value, f: &Value, g: impl Fn(&Value, &Value, &Value) -> V
     let (fr, fc) = dims(f);
     let rows = broadcast_dim(broadcast_dim(c.rows, tr), fr);
     let cols = broadcast_dim(broadcast_dim(c.cols, tc), fc);
+    let Some(n) = broadcast_len(rows, cols) else { return Value::Error(CellError::Num) };
     let get = |v: &Value, r: usize, col: usize| if let Value::Array(a) = v { a.get_broadcast(r, col) } else { v.clone() };
-    let mut data = Vec::with_capacity(rows * cols);
+    let mut data = Vec::with_capacity(n);
     for r in 0..rows {
         for col in 0..cols {
             data.push(g(&c.get_broadcast(r, col), &get(t, r, col), &get(f, r, col)));
         }
     }
     Value::from(Array { rows, cols, data })
+}
+
+/// One cell of a LAMBDA helper's result, or `None` for an array of more than one value: arrays
+/// can't nest, so the whole helper gives `#CALC!`, as in Excel.
+fn single(v: Value) -> Option<Value> {
+    match v {
+        Value::Array(a) if a.rows * a.cols > 1 => None,
+        v => Some(v.scalar()),
+    }
 }
 
 pub fn binary_values(op: BinOp, x: &Value, y: &Value, sys: gridcraft_core::DateSystem) -> Value {
@@ -1731,11 +1839,6 @@ pub fn resized_sum_range(sum: RangeRef, height: u32, width: u32) -> RangeRef {
     RangeRef::new(sum.start, CellRef::new(row, col))
 }
 
-/// Deepest expression [`precedents`] descends into. A formula within the length limit can nest
-/// operator chains about this deep (`1+1+…`); anything deeper (an expression built some other
-/// way) degrades to "recalculate every time" instead of risking the stack.
-const MAX_PRECEDENT_DEPTH: usize = 4_096;
-
 /// Most expression nodes [`precedents`] visits before giving up and marking the formula dynamic.
 const MAX_PRECEDENT_NODES: usize = 1_000_000;
 
@@ -1743,11 +1846,12 @@ const MAX_PRECEDENT_NODES: usize = 1_000_000;
 /// set when the formula uses INDIRECT/OFFSET/names/tables whose targets can change.
 ///
 /// Every node is visited once (#2183: range-operator chains used to re-walk shared operands,
-/// costing 2^k for k operands). Past [`MAX_PRECEDENT_DEPTH`] or [`MAX_PRECEDENT_NODES`] the
-/// result is conservative: `dynamic` is set so the formula recalculates every time.
+/// costing 2^k for k operands), with an explicit stack, so a flat chain as long as Excel allows
+/// (`1+1+…`, about 4,000 levels deep) never recurses. Past [`MAX_PRECEDENT_NODES`] the result
+/// is conservative: `dynamic` is set so the formula recalculates every time.
 pub fn precedents(wb: &Workbook, sheet: usize, e: &Expr) -> (Vec<Area>, bool) {
-    let mut c = Precedents { wb, sheet, out: Vec::new(), dynamic: false, nodes: 0 };
-    c.collect(e, 0, None);
+    let mut c = Precedents { wb, sheet, out: Vec::new(), dynamic: false, boxes: Vec::new() };
+    c.collect(e);
     (c.out, c.dynamic)
 }
 
@@ -1759,24 +1863,35 @@ fn union_box(boxes: &mut Vec<Area>, area: Area) {
     }
 }
 
+/// One entry of [`Precedents::collect`]'s explicit stack. `boxes` indexes
+/// [`Precedents::boxes`]: the bounding boxes of the innermost enclosing range operator, if any.
+enum PrecedentStep<'e> {
+    /// Visit an expression and queue its children.
+    Visit(&'e Expr, Option<usize>),
+    /// Both operands of a range operator have been visited: record the bounding boxes they
+    /// collected in `inner`, growing the `outer` operator's boxes too.
+    Close { inner: usize, outer: Option<usize> },
+}
+
 struct Precedents<'w> {
     wb: &'w Workbook,
     sheet: usize,
     out: Vec<Area>,
     dynamic: bool,
-    nodes: usize,
+    /// Per-sheet bounding boxes, one list per range operator (`A1:INDEX(…)`) met so far.
+    boxes: Vec<Vec<Area>>,
 }
 
 impl Precedents<'_> {
     /// Records `area`, also growing the bounding boxes of the enclosing range operator, if any.
-    fn add(&mut self, area: Area, boxes: &mut Option<&mut Vec<Area>>) {
-        if let Some(b) = boxes.as_deref_mut() {
+    fn add(&mut self, area: Area, boxes: Option<usize>) {
+        if let Some(b) = boxes.and_then(|i| self.boxes.get_mut(i)) {
             union_box(b, area);
         }
         self.out.push(area);
     }
 
-    fn push(&mut self, r: &Reference, range: RangeRef, boxes: &mut Option<&mut Vec<Area>>) {
+    fn push(&mut self, r: &Reference, range: RangeRef, boxes: Option<usize>) {
         match &r.sheet {
             SheetSel::Current => self.add(Area { sheet: self.sheet, range }, boxes),
             SheetSel::Named(n) => {
@@ -1794,22 +1909,41 @@ impl Precedents<'_> {
         }
     }
 
-    /// Visits `x` and its children once. `boxes` collects the per-sheet bounding box of every
-    /// area found inside the innermost enclosing range operator (`A1:INDEX(…)`).
-    fn collect(&mut self, x: &Expr, depth: usize, mut boxes: Option<&mut Vec<Area>>) {
-        self.nodes = self.nodes.saturating_add(1);
-        if depth > MAX_PRECEDENT_DEPTH || self.nodes > MAX_PRECEDENT_NODES {
-            self.dynamic = true;
-            return;
+    /// Visits every node of `root` once, parents before children, left to right. Areas found
+    /// inside a range operator (`A1:INDEX(…)`) also grow that operator's per-sheet bounding boxes.
+    fn collect(&mut self, root: &Expr) {
+        let mut pending = vec![PrecedentStep::Visit(root, None)];
+        let mut nodes = 0usize;
+        while let Some(step) = pending.pop() {
+            let (x, boxes) = match step {
+                PrecedentStep::Visit(x, boxes) => (x, boxes),
+                PrecedentStep::Close { inner, outer } => {
+                    let areas = self.boxes.get_mut(inner).map(std::mem::take).unwrap_or_default();
+                    for area in areas {
+                        self.add(area, outer);
+                    }
+                    continue;
+                }
+            };
+            nodes = nodes.saturating_add(1);
+            if nodes > MAX_PRECEDENT_NODES {
+                self.dynamic = true;
+                return;
+            }
+            self.visit(x, boxes, &mut pending);
         }
+    }
+
+    /// Handles one node for [`Precedents::collect`], queueing the children still to visit.
+    fn visit<'e>(&mut self, x: &'e Expr, boxes: Option<usize>, pending: &mut Vec<PrecedentStep<'e>>) {
         match x {
-            Expr::Ref(r) => self.push(r, r.range(), &mut boxes),
+            Expr::Ref(r) => self.push(r, r.range(), boxes),
             // The cells SUMIF/AVERAGEIF really read from the sum range (see `resized_sum_range`); when
             // the criteria range's size isn't known statically, recalculate the formula every time.
             Expr::Call(n, args) if resizes_sum_range(n, args.len()) => match (args.first(), args.get(2)) {
                 (Some(Expr::Ref(c)), Some(Expr::Ref(s))) => {
                     let (crit, sum) = (c.range(), s.range());
-                    self.push(s, resized_sum_range(sum, crit.height(), crit.width()), &mut boxes);
+                    self.push(s, resized_sum_range(sum, crit.height(), crit.width()), boxes);
                 }
                 (_, Some(Expr::Number(_) | Expr::Text(_) | Expr::Bool(_) | Expr::Error(_) | Expr::Array(_) | Expr::Missing)) => {}
                 _ => self.dynamic = true,
@@ -1822,30 +1956,31 @@ impl Precedents<'_> {
             Expr::Name(_) | Expr::Struct(_) => self.dynamic = true,
             Expr::Call(n, _) if gridcraft_functions::lookup(n).is_none() && !is_special(n) => self.dynamic = true,
             // A range ending in a function's result (`A1:INDEX(B1:B9,n)`) covers the cells between
-            // the references inside it, not only those references. Both operands are visited once
-            // here, collecting their bounding boxes on the way, and not again below.
+            // the references inside it, not only those references. Both operands are visited once,
+            // collecting their bounding boxes on the way, which `Close` then records.
             Expr::Binary(BinOp::Range, a, b) if !matches!((&**a, &**b), (Expr::Ref(_), Expr::Ref(_))) => {
-                let mut inner: Vec<Area> = Vec::new();
-                self.collect(a, depth + 1, Some(&mut inner));
-                self.collect(b, depth + 1, Some(&mut inner));
-                for area in inner {
-                    self.add(area, &mut boxes);
-                }
+                let inner = self.boxes.len();
+                self.boxes.push(Vec::new());
+                pending.push(PrecedentStep::Close { inner, outer: boxes });
+                pending.push(PrecedentStep::Visit(b, Some(inner)));
+                pending.push(PrecedentStep::Visit(a, Some(inner)));
                 return;
             }
             _ => {}
         }
+        // Children are pushed in reverse so they pop left to right.
+        let visit = |e: &'e Expr| PrecedentStep::Visit(e, boxes);
         match x {
-            Expr::Array(rows) => rows.iter().flatten().for_each(|e| self.collect(e, depth + 1, boxes.as_deref_mut())),
-            Expr::Unary(_, e) | Expr::Paren(e) => self.collect(e, depth + 1, boxes),
+            Expr::Array(rows) => pending.extend(rows.iter().flatten().rev().map(visit)),
+            Expr::Unary(_, e) | Expr::Paren(e) => pending.push(visit(e)),
             Expr::Binary(_, a, b) => {
-                self.collect(a, depth + 1, boxes.as_deref_mut());
-                self.collect(b, depth + 1, boxes);
+                pending.push(visit(b));
+                pending.push(visit(a));
             }
-            Expr::Call(_, args) => args.iter().for_each(|e| self.collect(e, depth + 1, boxes.as_deref_mut())),
+            Expr::Call(_, args) => pending.extend(args.iter().rev().map(visit)),
             Expr::Invoke(c, args) => {
-                self.collect(c, depth + 1, boxes.as_deref_mut());
-                args.iter().for_each(|e| self.collect(e, depth + 1, boxes.as_deref_mut()));
+                pending.extend(args.iter().rev().map(visit));
+                pending.push(visit(c));
             }
             _ => {}
         }
