@@ -1294,3 +1294,59 @@ fn median_large_values_recalculate_dependents() {
         assert!((t.num(cell) + 1.3).abs() < 1e-14);
     }
 }
+
+/// #2183: `INDEX(…):INDEX(…):…` used to re-walk each operand of the left-associative range chain,
+/// costing 2^k for k operands (28 took 40 s; 60 would take millennia), on open and on every edit.
+#[test]
+fn range_operator_chain_precedents_are_linear() {
+    let operands: Vec<String> = (1..=60).map(|i| format!("INDEX(A{i},1)")).collect();
+    let src = format!("=SUM({})", operands.join(":"));
+    let e = gridcraft_formula::parse(&src).unwrap();
+    let wb = Workbook::new();
+    let start = std::time::Instant::now();
+    let (areas, dynamic) = crate::eval::precedents(&wb, 0, &e);
+    assert!(start.elapsed() < std::time::Duration::from_secs(2), "took {:?}", start.elapsed());
+    assert!(!dynamic);
+    // The chain covers A1:A60, not only the 60 cells named in it.
+    let whole = gridcraft_core::RangeRef::new(c("A1"), c("A60"));
+    assert!(areas.iter().any(|a| a.sheet == 0 && a.range == whole), "{areas:?}");
+    // Each node is visited once: 60 references plus one box per range operator.
+    assert!(areas.len() < 200, "{} areas", areas.len());
+
+    // Through the recalculation engine: setting it is fast and editing a cell in the box recalculates.
+    let mut t = T::new();
+    for i in 1..=60 {
+        t.set(&format!("A{i}"), "1");
+    }
+    let start = std::time::Instant::now();
+    t.set("B1", &src);
+    assert!(start.elapsed() < std::time::Duration::from_secs(2), "took {:?}", start.elapsed());
+    assert_eq!(t.num("B1"), 60.0);
+    t.set("A30", "5");
+    assert_eq!(t.num("B1"), 64.0);
+}
+
+/// An expression deeper than any formula within the length limit can build degrades to a dynamic
+/// (always recalculated) dependency instead of recursing without bound.
+#[test]
+fn precedents_depth_is_bounded() {
+    let deep = std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(|| {
+            let mut e = gridcraft_formula::parse("=A1").unwrap();
+            for _ in 0..10_000 {
+                e = gridcraft_formula::Expr::Paren(Box::new(e));
+            }
+            let (_, dynamic) = crate::eval::precedents(&Workbook::new(), 0, &e);
+            dynamic
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(deep);
+    // Shallow nesting stays static.
+    let e = gridcraft_formula::parse("=((((A1))))").unwrap();
+    let (areas, dynamic) = crate::eval::precedents(&Workbook::new(), 0, &e);
+    assert!(!dynamic);
+    assert_eq!(areas.len(), 1);
+}
