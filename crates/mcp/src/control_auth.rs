@@ -86,13 +86,43 @@ pub fn auth_line(token: &str) -> String {
     json!({"auth": token}).to_string()
 }
 
+/// Why a handshake line was refused. It is for the app's own logs and tests: the peer only ever
+/// gets [`REFUSED`], whatever the reason, so a stranger learns nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthError {
+    /// The app has no token (an empty token never authenticates).
+    NoToken,
+    /// The line is longer than [`MAX_AUTH_LINE`].
+    TooLong,
+    /// The line is not UTF-8 JSON.
+    Malformed,
+    /// The `auth` field is missing, not a string, or not the token.
+    WrongToken,
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NoToken => "the control channel has no token",
+            Self::TooLong => "the handshake line is too long",
+            Self::Malformed => "the handshake line is not JSON",
+            Self::WrongToken => "the handshake has no token or the wrong one",
+        })
+    }
+}
+
+impl std::error::Error for AuthError {}
+
 /// Checks a connection's first line against `token`. `Ok` is the reply to send before serving
 /// requests; `Err` means the caller replies [`REFUSED`] and closes the connection.
-pub fn check_auth_line(line: &[u8], token: &str) -> Result<Value, ()> {
-    if token.is_empty() || line.len() > MAX_AUTH_LINE {
-        return Err(());
+pub fn check_auth_line(line: &[u8], token: &str) -> Result<Value, AuthError> {
+    if token.is_empty() {
+        return Err(AuthError::NoToken);
     }
-    let msg: Value = std::str::from_utf8(line).ok().and_then(|t| serde_json::from_str(t.trim()).ok()).ok_or(())?;
+    if line.len() > MAX_AUTH_LINE {
+        return Err(AuthError::TooLong);
+    }
+    let msg: Value = std::str::from_utf8(line).ok().and_then(|t| serde_json::from_str(t.trim()).ok()).ok_or(AuthError::Malformed)?;
     let given = msg.get("auth").and_then(Value::as_str).unwrap_or("");
     // Compare even when nothing was given, so a missing token costs what a wrong one does.
     if constant_time_eq(given.as_bytes(), token.as_bytes()) {
@@ -102,7 +132,7 @@ pub fn check_auth_line(line: &[u8], token: &str) -> Result<Value, ()> {
         }
         Ok(reply)
     } else {
-        Err(())
+        Err(AuthError::WrongToken)
     }
 }
 
