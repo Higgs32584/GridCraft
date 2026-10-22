@@ -12,7 +12,7 @@ use std::path::PathBuf;
 /// Whose opener to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Os {
-    MacOs,
+    Mac,
     Windows,
     /// Linux, the BSDs and other freedesktop systems: `xdg-open`.
     Other,
@@ -21,7 +21,7 @@ pub enum Os {
 impl Os {
     pub fn current() -> Os {
         if cfg!(target_os = "macos") {
-            Os::MacOs
+            Os::Mac
         } else if cfg!(windows) {
             Os::Windows
         } else {
@@ -80,7 +80,7 @@ pub fn opener_command(os: Os, target: &str, system_root: Option<&str>, windir: O
         return None;
     }
     Some(match os {
-        Os::MacOs => (PathBuf::from("/usr/bin/open"), target.to_string()),
+        Os::Mac => (PathBuf::from("/usr/bin/open"), target.to_string()),
         Os::Windows => {
             let exe = format!("{}\\explorer.exe", windows_dir(system_root, windir));
             (PathBuf::from(exe), escape_for_explorer(target))
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn mac_and_freedesktop_openers() {
-        let (exe, arg) = opener_command(Os::MacOs, "https://a.example", None, None).unwrap_or_default();
+        let (exe, arg) = opener_command(Os::Mac, "https://a.example", None, None).unwrap_or_default();
         assert_eq!((exe, arg.as_str()), (PathBuf::from("/usr/bin/open"), "https://a.example"));
         let (exe, _) = opener_command(Os::Other, "mailto:a@b.example", None, None).unwrap_or_default();
         assert_eq!(exe, PathBuf::from("xdg-open"));
@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn a_target_never_becomes_an_option() {
-        for os in [Os::MacOs, Os::Windows, Os::Other] {
+        for os in [Os::Mac, Os::Windows, Os::Other] {
             for bad in ["-a", "--help", "-e calc", "/select,C:\\x", "/root,C:\\", ""] {
                 assert_eq!(opener_command(os, bad, None, None), None, "{os:?} {bad:?}");
             }

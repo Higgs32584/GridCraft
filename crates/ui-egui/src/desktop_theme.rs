@@ -70,8 +70,10 @@ impl DesktopTheme {
 /// The session-bus connection the watcher keeps between reads, opened on first use.
 #[cfg(target_os = "linux")]
 type Link = Option<zbus::blocking::Connection>;
+/// Nothing to keep where there is no portal to ask: always `None` (not `()`, which would make the
+/// `let` bindings above unit-valued on those systems).
 #[cfg(not(target_os = "linux"))]
-type Link = ();
+type Link = Option<std::convert::Infallible>;
 
 /// Ask the portal once, over `link`'s connection (opened if absent, dropped if the bus went
 /// away). D-Bus calls block, so this belongs off the UI thread: the watcher's thread is its
