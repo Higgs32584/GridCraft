@@ -87,10 +87,19 @@ pub fn sniff_delimiter(text: &str, quote: char) -> u8 {
     best.0
 }
 
-/// Splits CSV text into records of fields.
-fn parse_records(text: &str, delim: char, quote: char, mut on_record: impl FnMut(Vec<String>) -> bool) {
+/// Splits CSV text into records of fields. Fields past the sheet's last column are dropped as
+/// they end (a line of a million commas keeps 16,384 fields), and the line is still read to its end.
+pub(crate) fn parse_records(text: &str, delim: char, quote: char, mut on_record: impl FnMut(Vec<String>) -> bool) {
     let mut field = String::new();
     let mut record: Vec<String> = vec![];
+    let max_fields = MAX_COLS as usize;
+    let end_field = |record: &mut Vec<String>, field: &mut String| {
+        if record.len() < max_fields {
+            record.push(std::mem::take(field));
+        } else {
+            field.clear();
+        }
+    };
     let mut in_q = false;
     let mut chars = text.chars().peekable();
     let mut field_started_quoted = false;
@@ -112,13 +121,13 @@ fn parse_records(text: &str, delim: char, quote: char, mut on_record: impl FnMut
             in_q = true;
             field_started_quoted = true;
         } else if c == delim {
-            record.push(std::mem::take(&mut field));
+            end_field(&mut record, &mut field);
             field_started_quoted = false;
         } else if c == '\r' || c == '\n' {
             if c == '\r' && chars.peek() == Some(&'\n') {
                 chars.next();
             }
-            record.push(std::mem::take(&mut field));
+            end_field(&mut record, &mut field);
             field_started_quoted = false;
             if !on_record(std::mem::take(&mut record)) {
                 return;
@@ -128,7 +137,7 @@ fn parse_records(text: &str, delim: char, quote: char, mut on_record: impl FnMut
         }
     }
     if !field.is_empty() || !record.is_empty() || field_started_quoted {
-        record.push(field);
+        end_field(&mut record, &mut field);
         on_record(record);
     }
 }
