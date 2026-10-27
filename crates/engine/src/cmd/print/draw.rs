@@ -1,5 +1,5 @@
 use super::layout::{DENSE_BLOCK, SheetLayout};
-use super::objects::draw_cell_picture;
+use super::objects::{PicCache, draw_cell_picture};
 use super::text::draw_text;
 use super::*;
 
@@ -225,7 +225,7 @@ fn draw_border(pg: &mut Page, b: &BorderLine, wb: &Workbook, x0: f32, y0: f32, x
 }
 
 /// Draws the cells of a block: fills, gridlines, data bars, borders and text.
-pub(super) fn draw_block(pg: &mut Page, b: &Block, gridlines: bool, cf: &mut Option<crate::cf::CfCache>) {
+pub(super) fn draw_block(pg: &mut Page, b: &Block, gridlines: bool, cf: &mut Option<crate::cf::CfCache>, pics: &mut PicCache) {
     let (bx, by) = (b.xs.first().copied().unwrap_or(0.0), b.ys.first().copied().unwrap_or(0.0));
     let (bw, bh) = (b.xs.last().copied().unwrap_or(bx) - bx, b.ys.last().copied().unwrap_or(by) - by);
     if bw <= 0.0 || bh <= 0.0 {
@@ -338,7 +338,7 @@ pub(super) fn draw_block(pg: &mut Page, b: &Block, gridlines: bool, cf: &mut Opt
             continue;
         }
         if let Some(picture) = sh.cell_pictures.get(c) {
-            draw_cell_picture(pg, &picture.data, (x, y, w, h), b.k);
+            draw_cell_picture(pg, pics, (b.si, *c), &picture.data, (x, y, w, h), b.k);
         } else {
             draw_text(pg, b, *c, l, (x, y, w, h), merged, &merges, (bx, bx + bw));
         }
