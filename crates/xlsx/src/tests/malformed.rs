@@ -283,15 +283,20 @@ fn many_sheets(names: &[String]) -> Vec<u8> {
     ])
 }
 
-/// #2159: a row of more `<c>` than the grid has columns is refused before it is built in memory.
+/// #2159: a row of endless `<c>` is not built in memory: the part's kept-element cap
+/// ([`crate::xml::MAX_XML_NODES`]) stops it, and the sheet is reported as damaged.
 #[test]
 fn a_row_wider_than_the_grid_is_refused() {
     let row = |n: usize| format!(r#"<sheetData><row r="1">{}</row></sheetData>"#, "<c/>".repeat(n));
-    assert!(matches!(read_xlsx(&minimal(&row(16_385), &[], "", "")), Err(IoError::TooLarge(_))));
+    let (wb, rep) = read_xlsx(&minimal(&row(crate::xml::MAX_XML_NODES + 1), &[], "", "")).unwrap();
+    assert!(wb.sheet(0).unwrap().cells.is_empty());
+    assert!(rep.warnings.iter().any(|w| w.contains("damaged")), "{:?}", rep.warnings);
     assert!(read_xlsx(&minimal(&row(16_384), &[], "", "")).is_ok());
-    // Every other part has a cap on children too (a merge list of more than a million entries).
-    let merges = format!("<sheetData/><mergeCells>{}</mergeCells>", r#"<mergeCell ref="A1:B2"/>"#.repeat((1 << 20) + 1));
-    assert!(matches!(read_xlsx(&minimal(&merges, &[], "", "")), Err(IoError::TooLarge(_))));
+    // Every other part has the cap too (a merge list of more than a million entries).
+    let merges = format!("<sheetData/><mergeCells>{}</mergeCells>", r#"<mergeCell ref="A1:B2"/>"#.repeat(crate::xml::MAX_XML_NODES + 1));
+    let (wb, rep) = read_xlsx(&minimal(&merges, &[], "", "")).unwrap();
+    assert!(wb.sheet(0).unwrap().merges.is_empty());
+    assert!(rep.warnings.iter().any(|w| w.contains("damaged")), "{:?}", rep.warnings);
 }
 
 /// #2159: overlapping `<col min=1 max=16384>` entries share one budget of column writes.
@@ -429,4 +434,45 @@ fn ordinary_overlapping_column_ranges_keep_last_declaration() {
     assert_eq!(last.size, None);
     assert!(last.hidden);
     assert_eq!(wb.styles.get(last.style.unwrap()).num_fmt.as_str(), "0.00");
+}
+
+/// Show Outline Symbols off (`showOutlineSymbols="0"`) is read and written back.
+#[test]
+fn outline_symbols_flag_round_trips() {
+    let body = r#"<sheetViews><sheetView showOutlineSymbols="0" workbookViewId="0"/></sheetViews><sheetData/>"#;
+    let (wb, _) = read_xlsx(&minimal(body, &[], "", "")).unwrap();
+    assert!(!wb.sheet(0).unwrap().show_outline_symbols);
+    let (back, _) = read_xlsx(&crate::write_xlsx(&wb).unwrap()).unwrap();
+    assert!(!back.sheet(0).unwrap().show_outline_symbols);
+    // Absent means shown.
+    let (wb, _) = read_xlsx(&minimal("<sheetData/>", &[], "", "")).unwrap();
+    assert!(wb.sheet(0).unwrap().show_outline_symbols);
+}
+
+/// Outline Settings (`outlinePr summaryBelow="0" summaryRight="0"`) are read and written back,
+/// between the tab color and the page setup properties.
+#[test]
+fn outline_summary_directions_round_trip() {
+    let body = r#"<sheetPr><tabColor rgb="FF00B050"/><outlinePr summaryBelow="0"/><pageSetUpPr fitToPage="1"/></sheetPr><sheetData/><pageSetup fitToWidth="1" fitToHeight="1"/>"#;
+    let (wb, _) = read_xlsx(&minimal(body, &[], "", "")).unwrap();
+    let sh = wb.sheet(0).unwrap();
+    assert!(!sh.summary_below && sh.summary_right);
+    let bytes = write_xlsx(&wb).unwrap();
+    let xml = String::from_utf8(crate::package::Package::open(&bytes).unwrap().read("xl/worksheets/sheet1.xml").unwrap().unwrap()).unwrap();
+    let (tab, pr, fit) = (xml.find("<tabColor"), xml.find("<outlinePr summaryBelow=\"0\"/>"), xml.find("<pageSetUpPr"));
+    assert!(tab < pr && pr < fit && tab.is_some(), "{xml}");
+    let (back, _) = read_xlsx(&bytes).unwrap();
+    assert!(!back.sheet(0).unwrap().summary_below && back.sheet(0).unwrap().summary_right);
+    let body = r#"<sheetPr><outlinePr summaryRight="0"/></sheetPr><sheetData/>"#;
+    let (wb, _) = read_xlsx(&minimal(body, &[], "", "")).unwrap();
+    let (back, _) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    let sh = back.sheet(0).unwrap();
+    assert!(sh.summary_below && !sh.summary_right);
+    // Absent means below and right, and the defaults write no `outlinePr`.
+    let (wb, _) = read_xlsx(&minimal("<sheetData/>", &[], "", "")).unwrap();
+    let sh = wb.sheet(0).unwrap();
+    assert!(sh.summary_below && sh.summary_right);
+    let bytes = write_xlsx(&wb).unwrap();
+    let xml = String::from_utf8(crate::package::Package::open(&bytes).unwrap().read("xl/worksheets/sheet1.xml").unwrap().unwrap()).unwrap();
+    assert!(!xml.contains("outlinePr"), "{xml}");
 }

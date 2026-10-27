@@ -13,10 +13,11 @@ use crate::IoError;
 /// Maximum element nesting accepted in any part.
 pub const MAX_DEPTH: usize = 256;
 
-/// Maximum child elements kept under one parent. Half a gigabyte of `<c/>` packs a hundred million
-/// children into one element, built in memory at ~25× the part's size; real parts never come close
-/// (streamed elements, such as rows and shared strings, are not kept and not counted).
-pub const MAX_CHILDREN: usize = 1 << 20;
+/// Most elements kept in one part's parsed XML tree: an emptied `El` costs well over a hundred
+/// bytes, so a highly-compressible part of endless empty elements could fit the package byte
+/// limit and still take gigabytes of tree before any semantic check ran. Parts whose big runs
+/// matter (worksheet rows, shared strings) are streamed instead and never hold this tree.
+pub const MAX_XML_NODES: usize = 1_000_000;
 
 /// An element: local name (namespace prefix dropped), attributes by local name, children and
 /// its direct text content.
@@ -215,13 +216,6 @@ pub fn parse(xml: &[u8]) -> Result<El, IoError> {
 /// Parses a part; complete elements named in `split` (below the root) are handed to `cb` and not
 /// kept in the returned tree.
 pub fn parse_streaming(xml: &[u8], split: &[&str], cb: &mut dyn FnMut(El) -> Result<(), IoError>) -> Result<El, IoError> {
-    parse_streaming_capped(xml, split, MAX_CHILDREN, cb)
-}
-
-/// [`parse_streaming`] with at most `split_cap` children under each streamed element (a worksheet
-/// row holds at most 16,384 cells). A parent past its cap ([`MAX_CHILDREN`] for the others) is
-/// refused with [`IoError::TooLarge`] before the rest of it is built.
-pub fn parse_streaming_capped(xml: &[u8], split: &[&str], split_cap: usize, cb: &mut dyn FnMut(El) -> Result<(), IoError>) -> Result<El, IoError> {
     let data = to_utf8(xml);
     let mut reader = Reader::from_reader(data.as_ref());
     {
@@ -235,23 +229,26 @@ pub fn parse_streaming_capped(xml: &[u8], split: &[&str], split_cap: usize, cb: 
     let mut stack: Vec<El> = Vec::new();
     let mut root: Option<El> = None;
     let mut buf = Vec::new();
+    // Elements kept in the tree so far, so a pathological part that passes the byte limits can
+    // still be refused before the tree itself outgrows memory.
+    let mut kept = 0usize;
     // Attach a finished element to its parent (or emit it / make it the root).
     fn finish(
         stack: &mut [El],
         root: &mut Option<El>,
         el: El,
         split: &[&str],
-        split_cap: usize,
         cb: &mut dyn FnMut(El) -> Result<(), IoError>,
+        kept: &mut usize,
     ) -> Result<(), IoError> {
         match stack.last_mut() {
             Some(parent) => {
                 if split.contains(&el.name.as_str()) {
                     cb(el)?;
                 } else {
-                    let cap = if split.contains(&parent.name.as_str()) { split_cap } else { MAX_CHILDREN };
-                    if parent.children.len() >= cap {
-                        return Err(IoError::TooLarge(format!("an XML element <{}> has more than {cap} child elements", parent.name)));
+                    *kept = kept.saturating_add(1);
+                    if *kept > MAX_XML_NODES {
+                        return Err(IoError::Xml(format!("the part holds more than {MAX_XML_NODES} elements")));
                     }
                     parent.children.push(el);
                 }
@@ -275,11 +272,11 @@ pub fn parse_streaming_capped(xml: &[u8], split: &[&str], split_cap: usize, cb: 
             }
             Event::Empty(e) => {
                 let el = start_el(&e);
-                finish(&mut stack, &mut root, el, split, split_cap, cb)?;
+                finish(&mut stack, &mut root, el, split, cb, &mut kept)?;
             }
             Event::End(_) => {
                 if let Some(el) = stack.pop() {
-                    finish(&mut stack, &mut root, el, split, split_cap, cb)?;
+                    finish(&mut stack, &mut root, el, split, cb, &mut kept)?;
                 }
             }
             Event::Text(t) => {
@@ -318,7 +315,7 @@ pub fn parse_streaming_capped(xml: &[u8], split: &[&str], split_cap: usize, cb: 
     }
     // Unclosed elements (truncated part): close them so we keep what we have.
     while let Some(el) = stack.pop() {
-        finish(&mut stack, &mut root, el, split, split_cap, cb)?;
+        finish(&mut stack, &mut root, el, split, cb, &mut kept)?;
     }
     root.ok_or_else(|| IoError::Xml("no root element".into()))
 }
@@ -383,7 +380,7 @@ pub fn encode_xstring(s: &str) -> String {
 }
 
 fn looks_like_escape(chars: &[char], i: usize) -> bool {
-    chars.get(i + 1) == Some(&'x') && chars.get(i + 6) == Some(&'_') && (i + 2..i + 6).all(|k| chars.get(k).is_some_and(|c| c.is_ascii_hexdigit()))
+    chars.get(i + 1) == Some(&'x') && chars.get(i + 6) == Some(&'_') && (i + 2..i + 6).all(|k| chars.get(k).is_some_and(char::is_ascii_hexdigit))
 }
 
 fn escape_unit(chars: &[char], i: usize) -> Option<u32> {
@@ -499,6 +496,14 @@ mod tests {
     }
 
     #[test]
+    fn a_part_of_endless_empty_elements_is_refused() {
+        assert!(parse(b"<r><x/><y t=\"1\"/><x/></r>").is_ok());
+        let xml = format!("<r>{}<y/></r>", "<x/>".repeat(MAX_XML_NODES + 1));
+        let err = parse(xml.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("elements"), "{err}");
+    }
+
+    #[test]
     fn phonetic_data_validates_offsets() {
         let x = r#"<si><t>課きく</t><rPh sb="0" eb="1"><t>カ</t></rPh><rPh sb="2" eb="9"><t>ク</t></rPh><rPh sb="2" eb="2"><t>x</t></rPh><rPh sb="1"/></si>"#;
         let si = parse(x.as_bytes()).unwrap();
@@ -574,36 +579,6 @@ mod tests {
             s.push_str("<a>");
         }
         assert!(parse(s.as_bytes()).is_err());
-    }
-
-    /// #2159: one parent with more children than any real part has is refused, not built.
-    #[test]
-    fn too_many_children_is_refused() {
-        let mut s = String::from("<root>");
-        for _ in 0..=MAX_CHILDREN {
-            s.push_str("<c/>");
-        }
-        s.push_str("</root>");
-        assert!(matches!(parse(s.as_bytes()), Err(IoError::TooLarge(_))));
-        // Streamed elements are handed out, not kept, so they don't count.
-        let mut n = 0usize;
-        assert!(
-            parse_streaming(s.as_bytes(), &["c"], &mut |_| {
-                n += 1;
-                Ok(())
-            })
-            .is_ok()
-        );
-        assert_eq!(n, MAX_CHILDREN + 1);
-        // A streamed element (a row) has its own, smaller cap.
-        let row = b"<sheetData><row><c/><c/><c/></row><row><c/><c/><c/><c/></row></sheetData>";
-        let mut rows = 0;
-        let res = parse_streaming_capped(row, &["row"], 3, &mut |_| {
-            rows += 1;
-            Ok(())
-        });
-        assert!(matches!(res, Err(IoError::TooLarge(_))));
-        assert_eq!(rows, 1);
     }
 
     #[test]
