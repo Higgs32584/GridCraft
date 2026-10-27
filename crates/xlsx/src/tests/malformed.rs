@@ -287,8 +287,8 @@ fn hyperlink_copies_are_bounded() {
     assert_eq!(wb.sheets[0].hyperlinks.len(), 10_000);
 }
 
-/// #2173: every rule of a conditional-format block copies the block's ranges; the copies are
-/// capped per sheet.
+/// #2173: every rule of a conditional-format block copies the block's ranges; the kept range
+/// cells (ranges x rules) are capped per sheet.
 #[test]
 fn conditional_format_range_copies_are_bounded() {
     let sq = (1..=10_000).map(|r| format!("A{r}")).collect::<Vec<_>>().join(" ");
@@ -296,10 +296,10 @@ fn conditional_format_range_copies_are_bounded() {
     let body = format!(r#"<sheetData/><conditionalFormatting sqref="{sq}">{rules}</conditionalFormatting>"#);
     let (wb, rep) = read_xlsx(&minimal(&body, &[], "", "")).unwrap();
     let cfs = &wb.sheets[0].cond_formats;
-    // The first rule plus 100 copies of 10,000 ranges.
-    assert_eq!(cfs.len(), 101);
+    // 400 rules of 10,000 one-cell ranges reach the 4,000,000 kept-cell cap.
+    assert_eq!(cfs.len(), 400);
     assert!(cfs.iter().all(|c| c.ranges.len() == 10_000));
-    assert!(rep.warnings.iter().any(|w| w.contains("too many ranges")), "{:?}", rep.warnings);
+    assert!(rep.warnings.iter().any(|w| w.contains("kept range cells")), "{:?}", rep.warnings);
 }
 
 /// #2173: cell formats share one copy of each custom number format (even an over-long one, which
@@ -312,7 +312,7 @@ fn style_copies_are_bounded() {
     let styles = format!(
         r#"<styleSheet><numFmts><numFmt numFmtId="164" formatCode="{code}"/><numFmt numFmtId="165" formatCode="0.000&quot;x&quot;"/></numFmts><fonts><font><name val="{font}"/></font></fonts><cellXfs>{xfs}<xf numFmtId="165"/><xf numFmtId="165"/></cellXfs><dxfs><dxf><numFmt numFmtId="166" formatCode="{code}"/></dxf></dxfs></styleSheet>"#
     );
-    let st = crate::styles::read_styles(&crate::xml::parse(styles.as_bytes()).unwrap(), &[]);
+    let st = crate::styles::read_styles(&crate::xml::parse(styles.as_bytes()).unwrap(), &[], "");
     assert_eq!(st.xfs.len(), 10_002);
     let first = &st.xfs[0].num_fmt.0;
     assert_eq!(first.len(), 50_000);
@@ -411,4 +411,45 @@ fn ordinary_overlapping_column_ranges_keep_last_declaration() {
     assert_eq!(last.size, None);
     assert!(last.hidden);
     assert_eq!(wb.styles.get(last.style.unwrap()).num_fmt.as_str(), "0.00");
+}
+
+/// Show Outline Symbols off (`showOutlineSymbols="0"`) is read and written back.
+#[test]
+fn outline_symbols_flag_round_trips() {
+    let body = r#"<sheetViews><sheetView showOutlineSymbols="0" workbookViewId="0"/></sheetViews><sheetData/>"#;
+    let (wb, _) = read_xlsx(&minimal(body, &[], "", "")).unwrap();
+    assert!(!wb.sheet(0).unwrap().show_outline_symbols);
+    let (back, _) = read_xlsx(&crate::write_xlsx(&wb).unwrap()).unwrap();
+    assert!(!back.sheet(0).unwrap().show_outline_symbols);
+    // Absent means shown.
+    let (wb, _) = read_xlsx(&minimal("<sheetData/>", &[], "", "")).unwrap();
+    assert!(wb.sheet(0).unwrap().show_outline_symbols);
+}
+
+/// Outline Settings (`outlinePr summaryBelow="0" summaryRight="0"`) are read and written back,
+/// between the tab color and the page setup properties.
+#[test]
+fn outline_summary_directions_round_trip() {
+    let body = r#"<sheetPr><tabColor rgb="FF00B050"/><outlinePr summaryBelow="0"/><pageSetUpPr fitToPage="1"/></sheetPr><sheetData/><pageSetup fitToWidth="1" fitToHeight="1"/>"#;
+    let (wb, _) = read_xlsx(&minimal(body, &[], "", "")).unwrap();
+    let sh = wb.sheet(0).unwrap();
+    assert!(!sh.summary_below && sh.summary_right);
+    let bytes = write_xlsx(&wb).unwrap();
+    let xml = String::from_utf8(crate::package::Package::open(&bytes).unwrap().read("xl/worksheets/sheet1.xml").unwrap().unwrap()).unwrap();
+    let (tab, pr, fit) = (xml.find("<tabColor"), xml.find("<outlinePr summaryBelow=\"0\"/>"), xml.find("<pageSetUpPr"));
+    assert!(tab < pr && pr < fit && tab.is_some(), "{xml}");
+    let (back, _) = read_xlsx(&bytes).unwrap();
+    assert!(!back.sheet(0).unwrap().summary_below && back.sheet(0).unwrap().summary_right);
+    let body = r#"<sheetPr><outlinePr summaryRight="0"/></sheetPr><sheetData/>"#;
+    let (wb, _) = read_xlsx(&minimal(body, &[], "", "")).unwrap();
+    let (back, _) = read_xlsx(&write_xlsx(&wb).unwrap()).unwrap();
+    let sh = back.sheet(0).unwrap();
+    assert!(sh.summary_below && !sh.summary_right);
+    // Absent means below and right, and the defaults write no `outlinePr`.
+    let (wb, _) = read_xlsx(&minimal("<sheetData/>", &[], "", "")).unwrap();
+    let sh = wb.sheet(0).unwrap();
+    assert!(sh.summary_below && sh.summary_right);
+    let bytes = write_xlsx(&wb).unwrap();
+    let xml = String::from_utf8(crate::package::Package::open(&bytes).unwrap().read("xl/worksheets/sheet1.xml").unwrap().unwrap()).unwrap();
+    assert!(!xml.contains("outlinePr"), "{xml}");
 }
