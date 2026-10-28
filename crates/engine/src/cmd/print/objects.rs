@@ -1,6 +1,6 @@
 use super::draw::{Block, PdfMeasure, Xf, draw_prims, rgb_of};
 use super::text::wrap_lines;
-use super::*;
+use super::{Anchor, CellRef, Font, Page, RangeRef, Rect, ShapeKind, Sheet, Value, Workbook};
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 
@@ -74,7 +74,7 @@ pub(super) fn draw_cell_picture(pg: &mut Page, pics: &mut PicCache, at: (usize, 
     let (px, px_w, px_h) = &*image;
     let fit = (w / iw as f32).min(h / ih as f32);
     let (pw, ph) = (iw as f32 * fit, ih as f32 * fit);
-    pg.image_rgba(x + pad + (w - pw) / 2.0, y + pad + (h - ph) / 2.0, pw, ph, px, *px_w, *px_h);
+    pg.image_rgba(Rect::new(x + pad + (w - pw) / 2.0, y + pad + (h - ph) / 2.0, pw, ph), px, [*px_w, *px_h]);
 }
 
 /// Decodes a cell picture to RGBA scaled to fit `tw`×`th` pixels, unless the PDF has no `room`
@@ -138,7 +138,7 @@ pub(super) fn draw_objects(pg: &mut Page, wb: &Workbook, si: usize, sh: &Sheet, 
         let room = pg.image_room();
         if let Some(decoded) = pics.get(PicKey::Floating(si, imi), || decode_image(&im.data, mw, mh, room)) {
             let (px, pw, ph) = &*decoded;
-            pg.image_rgba(x, y, w, h, px, *pw, *ph);
+            pg.image_rgba(Rect::new(x, y, w, h), px, [*pw, *ph]);
         }
     }
     for shp in &sh.shapes {
